@@ -1,0 +1,476 @@
+################################################################
+#### Objective Bayesian Analysis of Galicia Lead Data 
+################################################################
+
+
+################################################################
+#### Load the Following Packages
+library(PrevMap)               # To obtain Dataset
+library(rust)                  # Implement ROU
+library(matrixcalc)            
+library(sp) 
+library(prettymapr)
+library(ggmap)
+library(geoR)
+#### Packages Loading Done
+################################################################
+
+################################################################
+#### Load the Following Functions 
+emp.hpd = function(x, conf = 0.95){
+  conf = min(conf, 1-conf)
+  n = length(x)
+  nn = round(n*conf)
+  x = sort(x)
+  xx = x[(n-nn+1):n] - x[1:nn]
+  m = min(xx)
+  nnn = which(xx==m)[1]
+  return(c(x[nnn], x[n-nn+nnn]))
+}
+
+findMode = function(x, ...){ ## maybe not useful
+  tmp = density(x, ...)
+  ind = which(tmp$y==max(tmp$y))
+  tmp$x[ind[1]]
+}
+
+MaternHS = function(h, rho, nu){
+  h[h <= 1e-10] = 1e-10  # avoid sending exact zeroes to besselK
+  if(nu < 0) nu = 1e-10
+  if(rho > 1e9) rho = 1e9
+  con = (2^(nu-1))*gamma(nu) 
+  con = 1/con
+  return(con*((2*sqrt(nu)*h/rho)^nu)*besselK(2*sqrt(nu)*h/rho, nu))
+}
+
+MaternHS_drho = function(h, rho, nu = 0.5){
+  # avoid sending exact zeroes to besselK
+  h[h < 1e-10] = 1e-10
+  t = sqrt(2)*h/(rho*rho)
+  t2 = exp(-sqrt(2)*h/rho)*t
+  return(t2)
+}
+### Above: a lazy function with the same name as the function for general case below. 
+### Just to avoid change in the code. 
+### One can benchmark the time using the above function to fully use the expression that \nu = 0.5
+
+MaternHS_drho = function(h, rho, nu){
+  # avoid sending exact zeroes to besselK
+  h[h < 1e-10] = 1e-10
+  con = (2^(nu-1))*gamma(nu) 
+  con = 1/con
+  t = 2*sqrt(nu)*h/rho
+  return(con*(t^nu)*(-nu*besselK(t, nu)/rho+(besselK(t, nu-1) + 
+                    besselK(t, nu+1))*sqrt(nu)*h/(rho^2)))
+}
+
+## a comparison with matern in existing package to confirm it is correct
+# RandomFieldsUtils::matern(x = 1, nu = 1.2, scaling="handcockwallis") #x is h/rho
+# MaternHS_drho = function(h, rho, nu){
+#   h[h < 1e-8] = 1e-8 # same stragety
+#   logc = log(4)+(nu+1)*log(h)+(nu+1)*log(nu)/2-(nu+2)*log(rho)-lgamma(nu)
+#   c = exp(logc)
+#   B0 = besselK(x = 2*sqrt(nu)*h/rho, nu = nu-1, expon.scaled = FALSE)
+#   return(c*B0)
+# }
+
+
+#### Need Quantities: 
+## max_rho
+## nobs
+## D
+## jitter
+## z
+## nu
+## prior_a_ref
+
+rho_noX_ref_rou <- function(x){
+  xmin = .Machine$double.xmin
+  if(x > max_rho) x = max_rho
+  if(x < 1e-8){
+    Sigma = diag(1, nrow = nobs) 
+    Sigma_drho = diag(0, nrow = nobs)
+  }else{
+    Sigma = MaternHS(h = D, rho = x, nu = nu)
+    Sigma_drho = MaternHS_drho(h = D, rho = x, nu = nu)
+    diag(Sigma) = 1; diag(Sigma_drho) = 0
+  }
+  cholSigma = try(chol(Sigma), silent = TRUE)
+  if(inherits(cholSigma, "try-error")){ 
+    Sigma_inv = matrixcalc::svd.inverse(Sigma+diag(jitter, nobs)) 
+    eigen_values = ifelse(eigen(Sigma)$values > xmin, eigen(Sigma)$values, xmin)
+    logdetSigma = Inf  
+  }else{
+    Sigma_inv = chol2inv(cholSigma)
+    logdetSigma = 2*sum(log(diag(cholSigma)))
+  }
+  suminv = max(xmin, sum(Sigma_inv))
+  colsumSigma_inv = colSums(Sigma_inv)
+  betahat = sum(colsumSigma_inv*z)/suminv
+  residual = matrix(z - betahat, ncol = 1)
+  Ssq = max(xmin, sum(tcrossprod(residual)*Sigma_inv))
+  loglik = -logdetSigma/2 - log(suminv)/2 -(prior_a_ref-1+(nobs-1)/2)*log(Ssq)
+  
+  ## Reference Prior
+  SX = matrix(colsumSigma_inv, ncol = 1)
+  SX2 = matrix(rowSums(Sigma_inv), ncol = 1) 
+  # These two should be essentially same, unless we have ill-conditioned matrix with svd inverse
+  Q = Sigma_inv - tcrossprod(SX2, SX)/suminv
+  W = Sigma_drho %*% Q
+  Tr = max(sum(W*t(W)) - (sum(diag(W))^2)/(nobs-1), 0) ## Trace 
+  log_prior = log(Tr)/2
+  log_post = loglik+log_prior
+  betahatvar = 1/suminv            ## Directly used to sample beta if needed 
+  if(x == max_rho) log_post = -Inf
+  return(list(log_post = log_post, log_prior = log_prior, log_lik = loglik, 
+              Ssq = Ssq, betahat = betahat, betahatvar = betahatvar))
+}
+
+
+#### Need the Following Quantities: 
+## max_rho
+## nobs
+## D
+## jitter
+## z
+## nu
+## prior_a_aref
+## M1; M2; kmax; lag1; lag2 to obtain w_sq  m_times4 and m_times2 
+# need x >= 0
+
+rho_noX_aref_rou <- function(x){
+  xmin = .Machine$double.xmin
+  if(x > max_rho) x = max_rho
+  if(x < 1e-8){
+    Sigma = diag(1, nrow = nobs) 
+  }else{
+    Sigma = MaternHS(h = D, rho = x, nu = nu)
+    diag(Sigma) = 1
+  }
+  cholSigma = try(chol(Sigma), silent = TRUE)
+  if(inherits(cholSigma, "try-error")){ ## use svd
+    Sigma_inv = matrixcalc::svd.inverse(Sigma+diag(jitter, nobs))
+    eigen_values = ifelse(eigen(Sigma)$values > xmin, eigen(Sigma)$values, xmin)
+    logdetSigma = Inf 
+  }else{
+    Sigma_inv = chol2inv(cholSigma)
+    logdetSigma = 2*sum(log(diag(cholSigma)))
+  }
+  suminv = max(xmin, sum(Sigma_inv))
+  colsumSigma_inv = colSums(Sigma_inv)
+  betahat = sum(colsumSigma_inv*z)/suminv
+  residual = matrix(z - betahat, ncol = 1)
+  Ssq = max(xmin, sum(tcrossprod(residual)*Sigma_inv))
+  loglik = -logdetSigma/2 - log(suminv)/2 -(prior_a_aref-1+(nobs-1)/2)*log(Ssq)
+  ## Approximate reference prior 
+  rho_sq = x^2
+  Mat_Denom = (4*nu/rho_sq + w_sq)^(-(nu+1))
+  Mat_Num = Mat_Denom*(4-rho_sq*w_sq)/(4*nu+rho_sq*w_sq)
+  A_qt = (nu/x)*rowSums(Mat_Num)/rowSums(Mat_Denom)
+  A1 = rep(A_qt[1:m_times4], 3)
+  A2 = A_qt[(m_times4+1):m_times2]
+  A = c(A_qt, A1, A2)
+  sdA = sd(A)
+  if(is.nan(sdA) | is.na(sdA)) sdA = 0
+  log_prior = log(sdA)
+  log_post = loglik+log_prior
+  if(x == max_rho) log_post = -Inf
+  betahatvar = 1/suminv
+  return(list(log_post = log_post, log_prior = log_prior, log_lik = loglik, 
+              Ssq = Ssq, betahat = betahat, betahatvar = betahatvar))
+}
+
+
+wsq_2d_fun = function(M1, M2, kmax, lag1, lag2){
+  dim = 2
+  freqx=seq(-pi/lag1+2*pi/(lag1*M1), pi/lag1, length = M1)
+  freqy=seq(-pi/lag2+2*pi/(lag2*M2), pi/lag2, length = M2)
+  w_use = as.matrix(expand.grid(freqx, freqy))
+  id_0 = c(M1*M2/2, M1*(M2-1/2), M1*M2)
+  id_a = seq(M1*(M2/2-1)+M1/2+1, M1*M2/2-1)
+  id_b = seq(M1*M2/2+M1/2, M1*(M2-2)+M1/2, by = M1)
+  id_c = M1*(M2/2 + rep(0:(M2/2-2), each = M1/2-1)) + seq(M1/2+1, M1-1)
+  id_e = seq(M1*(M2-1)+M1/2+1, M1*M2-1)
+  id_f = seq(M1*M2/2+M1, M1*(M2-2)+M1, by = M1)
+  lag = sqrt(lag1^2 + lag2^2)/sqrt(2) 
+  # In model we assume lag1=lag2 but they can be different
+  id_qt = c(id_c, id_a, id_b, id_e, id_f, id_0) 
+  m_comb = (M1/2+1)*(M2/2+1)-1
+  # order: Times 4 (M1/2-1)*(M2/2-1), Times 2 (M1+M2-4), Times 1 (3)
+  # Total: (M1/2+1)*(M2/2+1)-1 Unique frequencies combo
+  m_times4 = (M1/2-1)*(M2/2-1)
+  m_times2 = m_times4+(M1+M2-4)
+  w_use = w_use[id_qt, ]
+  n_comb = (2*kmax+1)^2
+  Alias_f1 = rep(-kmax:kmax, each = 2*kmax+1)
+  Alias_f2 = rep(-kmax:kmax, 2*kmax+1)
+  Mat_K1 = 2*pi*matrix(rep(Alias_f1, m_comb), ncol = n_comb, nrow = m_comb, byrow = TRUE)/lag1
+  Mat_K2 = 2*pi*matrix(rep(Alias_f2, m_comb), ncol = n_comb, nrow = m_comb, byrow = TRUE)/lag2
+  w_sq1 = (w_use[,1]+Mat_K1)^2
+  w_sq2 = (w_use[,2]+Mat_K2)^2
+  w_sq = w_sq1+w_sq2
+  return(list(w_sq = w_sq, m_times2 = m_times2, m_times4 = m_times4))
+}
+### Function Loading Done
+################################################################
+
+
+
+################################################################
+### Data Analysis of Galicia Dataset 
+galicia = PrevMap::galicia
+galicia2000 = galicia[64:195, ]
+
+### If we want to see its geographical information 
+galicia2000_longlat = data.frame(X = galicia2000$x, Y = galicia2000$y)
+sputm = sp::SpatialPoints(galicia2000_longlat, proj4string=CRS("+proj=utm +zone=29+datum=WGS84"))  
+spgeo = sp::spTransform(sputm, CRS("+proj=longlat +datum=WGS84"))
+galicia2000_longlat = as.data.frame(spgeo)
+galicia2000_longlat$lead = galicia2000$lead
+
+### Plot with Geographical information - real map version, original lead concentration
+ggmap::qmplot(X, Y, data = galicia2000_longlat, size = I(0), maptype = "watercolor", 
+              darken = c(0, "black"), zoom = 9)+
+  geom_point(aes(x = X, y = Y, size = I(0.3+log(lead))), colour = "blue", data =galicia2000_longlat)
+
+## Plot with a border file in PrevMap - a classical version
+## Scale by 1e5 as in Diggle et al. (2010)
+postscript("Galicia-geo.eps", horizontal = FALSE, onefile = FALSE, paper = "special")
+r_scale = 1e5
+galicia.boundary = PrevMap::galicia.boundary
+plot(galicia.boundary$x/r_scale, galicia.boundary$y/r_scale, type = 'l', col="darkgrey", 
+     xlim = c(4.65, 7.0), ylim = c(46.1, 48.6), # ann=FALSE, 
+     xlab = "x (100 km)", ylab = "y (100 km)")
+points(galicia2000$x/r_scale, galicia2000$y/r_scale, 
+       cex = 0.35+0.27*log(galicia2000$lead), pch = 16, col = 'blue')
+
+prettymapr::addnortharrow(pos = "topleft", padin = c(0.1, 0.1), scale = 0.35,
+                          lwd = 1, border = "black", cols = c("white", "black"),
+                          text.col = "black")
+dev.off()
+# 370 times 420 in eps
+
+## Assessment: no nugget model works well
+vario_galicia = geoR::variog(coords = galicia2000[,1:2], data = log(galicia2000$lead),
+                             max.dist = 120000)
+plot(vario_galicia)
+vario_est = variofit(vario_galicia, fix.nugget = TRUE, nugget = 0)
+
+
+## Produce the plot of variogram after scaling a r_scale as in Diggle et al. (2010)
+u_scale = vario_galicia$u/r_scale
+plot(u_scale, vario_galicia$v, xlim = c(0, 1.2), ylim = c(0, 0.25), 
+     xlab = "r", ylab = "V(r)") #ylab = expression(paste(gamma(r))))
+plot_x = seq(0, 1.2, by = 0.01)
+range_est = vario_est$cov.pars[2]/r_scale   # least-square estimate
+sigsq_est = vario_est$cov.pars[1]           # least-square estimate
+lines(x = plot_x, y = sigsq_est -sigsq_est*exp(-plot_x/range_est))
+
+## Now Start fit the data using likelihood-based method 
+likfitdata = likfit(coords = galicia2000[,1:2], data = log(galicia2000$lead), 
+                    trend = "cte", ini.cov.pars = c(1.5, 15100), 
+                    fix.kappa = TRUE, fix.nugget = TRUE, nugget = 0)
+summary(likfitdata)
+
+## Now start using objective Bayesian methods with reference prior/approximate reference priors 
+## Settings: 
+z = log(galicia2000$lead)
+D = unname(as.matrix(dist(cbind(galicia2000$x, galicia2000$y)/r_scale, method = "euclidean")))
+nu = 0.5
+jitter = 1e-10
+nobs = nrow(D)
+max_rho = 1e8 
+prior_a_aref = prior_a_ref = 1
+quantile(apply(D, 1, function(x) sort(x)[2]), 0.9)
+max(apply(D, 1, function(x) sort(x)[2]))
+
+# roughly the "largest lags" in horizontal/vertical direction is approximately 0.17
+# the "largest lags" of neighboring locations is 0.21
+# use 0.2 seems work fine, in general it is not too sensitive 
+
+w_tmp = wsq_2d_fun(M1 = 16, M2 = 16, kmax = 5, lag1 = 0.2, lag2 = 0.2)
+w_sq = w_tmp$w_sq
+m_times2 = w_tmp$m_times2
+m_times4 = w_tmp$m_times4
+## Settings end
+
+###########################################################################
+##### Plot the (normalized) Prior and Posterior densities 
+###########################################################################
+
+int_r_prior = function(x) sapply(x, function(x) exp(rho_noX_ref_rou(x)$log_prior))
+int_ar_prior = function(x) sapply(x, function(x) exp(rho_noX_aref_rou(x)$log_prior))
+int_r_post = function(x) sapply(x, function(x) exp(rho_noX_ref_rou(x)$log_post))
+int_ar_post = function(x) sapply(x, function(x) exp(rho_noX_aref_rou(x)$log_post)) 
+
+denum_r_prior = integrate(f = int_r_prior, lower = 0, upper = 25)$value
+denum_ar_prior = integrate(f = int_ar_prior, lower = 0, upper = 25)$value
+denum_r_post = integrate(f = int_r_post, lower = 0, upper = 25)$value
+denum_ar_post = integrate(f = int_ar_post, lower = 0, upper = 25)$value
+# seems numerical stable up to 25 
+
+x_plot_seq = seq(0.01, 2.5, by = 0.01)
+y_r_prior = sapply(x_plot_seq, int_r_prior)/denum_r_prior
+y_ar_prior = sapply(x_plot_seq, int_ar_prior)/denum_ar_prior
+y_r_post = sapply(x_plot_seq, int_r_post)/denum_r_post
+y_ar_post = sapply(x_plot_seq, int_ar_post)/denum_ar_post
+
+par(mgp=c(1.9,0.8,0), mai = c(0.6, 0.6, 0.2, 0.2))
+plot(x_plot_seq, y_r_prior, type = 'l', ylim = c(0, 8.4), lty = 2, 
+     xlab = expression(paste(vartheta)), lwd = 1.6, 
+     ylab = "Density", cex.axis = 0.9, cex.main = 0.8, 
+     cex.lab = 0.8)
+lines(x_plot_seq, y_ar_prior, type = 'l', col = 'red', lty = 2, lwd = 1.6)
+lines(x_plot_seq, y_r_post, type = 'l', col = 'black', lty = 1, lwd = 1.5)
+lines(x_plot_seq, y_ar_post, type = 'l', col = 'red', lty = 1, lwd = 1.5)
+legend(1.0, 8, legend = c("Exact Ref Prior", "Appr Ref Prior", "Exact Ref Posterior", "Appr Ref Posterior"), 
+       lwd=c(1.5, 1.5, 1.5, 1.5), bty = 'n',
+       col=c("black","red", "black", "red"), lty = c(2, 2, 1, 1), cex = 0.75)
+
+
+####  Analytically we get the posterior mode 
+map_rho_r = optim(0.2, fn = function(x) -rho_noX_ref_rou(x)$log_post, method = "Brent", 
+                  lower = 0, upper = 200, hessian = TRUE)$par
+
+map_rho_ar = optim(0.2, fn = function(x) -rho_noX_aref_rou(x)$log_post, method = "Brent", 
+                   lower = 0, upper = 200, hessian = TRUE)$par
+
+
+#### Monte Carlo Estimation using ROU 
+t0 = proc.time()
+set.seed(2021)  # arbitrary seed to reproduce 
+result_r_rho = rust::ru(logf = function(x) rho_noX_ref_rou(x)$log_post, r = 1, init = 0.3, n = 10000)
+t1 = proc.time()-t0   
+rho_mc_r = result_r_rho$sim_vals
+# 277 seconds if using Matern derivative general form with Bessel function's call
+# 122 seconds if using exponential form directly 
+
+result_r_rho$pa  # 75.4
+plot(result_r_rho$sim_vals,type = 'l')
+round(emp.hpd(result_r_rho$sim_vals), 3) #[1] 0.168 0.613
+
+t0 = proc.time()
+set.seed(2020)
+result_ar_rho = rust::ru(logf = function(x) rho_noX_aref_rou(x)$log_post, r = 1, init = 0.3, n = 10000)
+t2 = proc.time()-t0   # 78 seconds 
+rho_mc_ar = result_ar_rho$sim_vals
+  
+result_ar_rho$pa  # 75.3
+plot(result_ar_rho$sim_vals,type = 'l')
+round(emp.hpd(result_ar_rho$sim_vals), 3) #[1] 0.177 0.603
+
+
+####  Sample Posterior of beta and sigsq
+post_betasigsq = function(x){
+  ## basically calculate Sigma_inv one more time
+  ## in large experiments these two steps can be combined
+  xmin = .Machine$double.xmin
+  Sigma = MaternHS(h = D, rho = x, nu = nu)
+  cholSigma = try(chol(Sigma), silent = TRUE)
+  Sigma_inv = chol2inv(cholSigma)
+  suminv = max(xmin, sum(Sigma_inv))
+  colsumSigma_inv = colSums(Sigma_inv)
+  betahat = sum(colsumSigma_inv*z)/suminv
+  residual = matrix(z - betahat, ncol = 1)
+  Ssq = max(xmin, sum(tcrossprod(residual)*Sigma_inv))
+  betahatvar = 1/suminv
+  sigsq_mc = 1/rgamma(n = 1, shape =  (nobs-1)/2, rate = Ssq/2) # assume a = 1
+  beta_mc = rnorm(1, mean = betahat, sd = sqrt(sigsq_mc*betahatvar))
+  return(c(beta_mc, sigsq_mc))
+}
+
+set.seed(2019)
+betasigsq_mc = t(sapply(c(rho_mc_r, rho_mc_ar), post_betasigsq))
+betasigsq_mc_r = betasigsq_mc[1:10000, ]
+betasigsq_mc_ar = betasigsq_mc[10001:20000, ]
+
+round(emp.hpd(betasigsq_mc_r[, 1]), 3) # beta hpd #[1] 0.462 1.013
+round(emp.hpd(betasigsq_mc_r[, 2]), 3) # sigsq hpd #[1] 0.133 0.368
+round(emp.hpd(betasigsq_mc_ar[, 1]), 3) # beta hpd #[1] 0.465 0.999
+round(emp.hpd(betasigsq_mc_ar[, 2]), 3) # sigsq hpd #[1] 0.135 0.359
+
+
+###########################################################################
+##### Model Comparison with Marginal Likelihood
+###########################################################################
+
+nu_seq = seq(0.02, 2, by = 0.02)
+
+## Approximate reference prior after normalization
+C_nu_fun = function(x, nu){
+  rho_sq = x^2
+  Mat_Denom = (4*nu/rho_sq + w_sq)^(-(nu+1))
+  Mat_Num = Mat_Denom*(4-rho_sq*w_sq)/(4*nu+rho_sq*w_sq)
+  A_qt = (nu/x)*rowSums(Mat_Num)/rowSums(Mat_Denom)
+  A1 = rep(A_qt[1:m_times4], 3)
+  A2 = A_qt[(m_times4+1):m_times2]
+  A = c(A_qt, A1, A2)
+  sdA = sd(A)
+  if(is.nan(sdA) | is.na(sdA)) sdA = 0
+  return(sdA)
+}
+
+rho_noX_aref_nu <- function(x, nu){
+  xmin = .Machine$double.xmin
+  if(x > max_rho) x = max_rho
+  if(x < 1e-8){
+    Sigma = diag(1, nrow = nobs) 
+  }else{
+    Sigma = MaternHS(h = D, rho = x, nu = nu)
+    diag(Sigma) = 1
+  }
+  cholSigma = try(chol(Sigma), silent = TRUE)
+  if(inherits(cholSigma, "try-error")){ ## use svd
+    Sigma_inv = matrixcalc::svd.inverse(Sigma+diag(jitter, nobs))
+    eigen_values = ifelse(eigen(Sigma)$values > xmin, eigen(Sigma)$values, xmin)
+    logdetSigma = Inf 
+  }else{
+    Sigma_inv = chol2inv(cholSigma)
+    logdetSigma = 2*sum(log(diag(cholSigma)))
+  }
+  suminv = max(xmin, sum(Sigma_inv))
+  colsumSigma_inv = colSums(Sigma_inv)
+  betahat = sum(colsumSigma_inv*z)/suminv
+  residual = matrix(z - betahat, ncol = 1)
+  Ssq = max(xmin, sum(tcrossprod(residual)*Sigma_inv))
+  loglik = -logdetSigma/2 - log(suminv)/2 -(prior_a_aref-1+(nobs-1)/2)*log(Ssq)
+  ## Approximate reference prior 
+  rho_sq = x^2
+  Mat_Denom = (4*nu/rho_sq + w_sq)^(-(nu+1))
+  Mat_Num = Mat_Denom*(4-rho_sq*w_sq)/(4*nu+rho_sq*w_sq)
+  A_qt = (nu/x)*rowSums(Mat_Num)/rowSums(Mat_Denom)
+  A1 = rep(A_qt[1:m_times4], 3)
+  A2 = A_qt[(m_times4+1):m_times2]
+  A = c(A_qt, A1, A2)
+  sdA = sd(A)
+  if(is.nan(sdA) | is.na(sdA)) sdA = 0
+  log_prior = log(sdA)
+  log_post = loglik+log_prior  ## prior is not normalized
+  if(x == max_rho) log_post = -Inf
+  return(exp(log_post))
+}
+
+int_C_nu_fun = function(x, nu) sapply(x, function(x) C_nu_fun(x, nu))
+C_nu_seq = sapply(nu_seq, function(nu) integrate(f = int_C_nu_fun, lower = 0, upper = Inf, nu = nu)$value)
+
+#### Now obtain the integral without C_nu_seq which basically integrate over the marginal posterior of rho
+
+m_nu_fun = function(x, nu) sapply(x, function(x) rho_noX_aref_nu(x, nu))
+C_m_seq = sapply(nu_seq, function(nu) integrate(f = m_nu_fun, lower = 0, upper = Inf, nu = nu)$value)
+
+m_nu_seq = C_m_seq/C_nu_seq
+m_nu_normalized = (1/0.02)*m_nu_seq/sum(m_nu_seq)
+
+plot(nu_seq, m_nu_normalized, type = 'l', )
+
+nu_optimal = nu_seq[which.max(m_nu_seq*100)]
+
+plot(nu_seq, m_nu_normalized, type = 'l', ylim = c(0, 1.05), lty = 1, 
+     xlab = expression(paste(nu)), lwd = 1.6, 
+     ylab = "Integrated Likelihood", cex.axis = 0.9, cex.main = 0.8, 
+     cex.lab = 0.8)
+
+
+### End
+save.image(file = "Galicia2000.RData")
+galicia.boundary_scale = galicia.boundary/r_scale
