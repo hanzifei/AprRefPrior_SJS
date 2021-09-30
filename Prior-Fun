@@ -1,0 +1,250 @@
+#### Functions to Calculate Prior Only with Integration 
+
+MaternHS = function(h, rho, nu){
+  # avoid sending exact zeroes to besselK
+  h[h <= 1e-10] = 1e-10  # assume the data is not that clustered
+  if(nu < 0) nu = 1e-10
+  if(rho > 1e9) rho = 1e9
+  con = (2^(nu-1))*gamma(nu) 
+  con = 1/con
+  return(con*((2*sqrt(nu)*h/rho)^nu)*besselK(2*sqrt(nu)*h/rho, nu))
+}
+
+MaternHS_drho = function(h, rho, nu){ ### The old version
+   # avoid sending exact zeroes to besselK
+   h[h < 1e-8] = 1e-8 # same stragety
+   con = (2^(nu-1))*gamma(nu)
+   con = 1/con
+   t = 2*sqrt(nu)*h/rho
+   return(con*(t^nu)*(-nu*besselK(t, nu, expon.scaled = FALSE)/rho +
+                        (besselK(t, nu-1, expon.scaled = FALSE) +
+                           besselK(t, nu+1))*sqrt(nu)*h/(rho^2)))
+}
+
+MaternHS_drho2 = function(h, rho, nu){ ### The new version - 2021-06-25
+  h[h < 1e-8] = 1e-8 # same stragety
+  logc = log(4)+(nu+1)*log(h)+(nu+1)*log(nu)/2-(nu+2)*log(rho)-lgamma(nu)
+  c = exp(logc)
+  B0 = besselK(x = 2*sqrt(nu)*h/rho, nu = nu-1, expon.scaled = FALSE)
+  return(c*B0)
+}
+
+### Exact without covariate 
+rho_exact_fun = function(nu, locs, rhovec, dim = 1, intlow = 0.001, inthigh = 10, normalize = TRUE, divide = 100L){
+  if(dim == 1){
+    n = length(locs)
+  }else{
+    n = nrow(locs)
+  }
+  D = as.matrix(dist(locs, method = "euclidean"))
+  X = matrix(1, nrow = n, ncol = 1)
+  Sigma = diag(1, nr = n)
+  Sigma_drho = diag(0, nr = n)
+  
+  f1 = function(rho){
+    if(rho == 0) return(0)
+    if(is.finite(nu)){
+      Sigma = MaternHS(h = D, rho = rho, nu = nu)
+      Sigma_drho = MaternHS_drho(h = D, rho = rho, nu = nu)
+      diag(Sigma_drho) = 0
+    }else{
+      Sigma = sqexpHS(h = D, rho = rho)
+      Sigma_drho = sqexpHS_drho(h = D, rho = rho)
+      diag(Sigma_drho) = 0
+    }
+    Sigma_inv = try(solve(Sigma), silent = TRUE)
+    if(inherits(Sigma_inv, "try-error")){  ## use svd if ill-conditioned
+      Sigma_inv = matrixcalc::svd.inverse(Sigma)
+    }
+    SX = matrix(rowSums(Sigma_inv), ncol = 1)
+    Q = Sigma_inv - tcrossprod(SX)/sum(Sigma_inv)
+    W = Sigma_drho %*% Q
+    Tr = max(sum(W*t(W)) - (sum(diag(W))^2)/(n-1), .Machine$double.xmin)
+    prior_rho = sqrt(Tr)
+    return(prior_rho)
+  }
+  intf1 = function(x) sapply(x, f1)
+  constant = 1
+  if(isTRUE(normalize)) constant = integrate(f = intf1, lower = intlow, upper = inthigh, subdivisions = divide)$value
+  outf1 = sapply(rhovec, f1)
+  return(outf1/constant)
+}
+### Exact with covariate 
+rho_exact_fun_cov = function(X = NULL, nu, locs, rhovec, dim = 1, intlow = 0.001, inthigh = 20, normalize = TRUE, divide = 100L){
+  if(dim == 1){
+    n = length(locs)
+  }else{
+    n = nrow(locs)
+  }
+  D = as.matrix(dist(locs, method = "euclidean"))
+  if(is.null(X)) X = matrix(1, nrow = n, ncol = 1)
+  Sigma = diag(1, nr = n)
+  Sigma_drho = diag(0, nr = n)
+  p = ncol(X)
+  f1 = function(rho){
+    if(rho == 0) return(0)
+    if(is.finite(nu)){
+      Sigma = MaternHS(h = D, rho = rho, nu = nu)
+      Sigma_drho = MaternHS_drho(h = D, rho = rho, nu = nu)
+      diag(Sigma_drho) = 0
+    }else{
+      Sigma = sqexpHS(h = D, rho = rho)
+      Sigma_drho = sqexpHS_drho(h = D, rho = rho)
+      diag(Sigma_drho) = 0
+    }
+    Sigma_inv = try(solve(Sigma), silent = TRUE)
+    if(inherits(Sigma_inv, "try-error")){  ## use svd if ill-conditioned (but result may not good)
+      Sigma_inv = matrixcalc::svd.inverse(Sigma)
+    }
+    # Sigma_inv = try(solve(as.matrix(Sigma+nug_mat)), silent = TRUE)
+    Q = Sigma_inv - Sigma_inv %*% X %*% solve(t(X) %*% Sigma_inv %*% X) %*% t(X) %*% Sigma_inv
+    W = Sigma_drho%*%Q
+    Tr = max(sum(W*t(W)) - (sum(diag(W))^2)/(n-p), .Machine$double.xmin)
+    prior_rho = sqrt(Tr)
+    return(prior_rho)
+  }
+  intf1 = function(x) sapply(x, f1)
+  constant = 1
+  if(isTRUE(normalize)) constant = integrate(f = intf1, lower = intlow, upper = inthigh, subdivisions = divide)$value
+  outf1 = sapply(rhovec, f1)
+  return(outf1/constant)
+}
+
+## Approximate with Bose (2018) with or without covariate 
+rho_apr_fun_2d = function(X = NULL, nu, M1, M2, rhovec, lag1 = 1, lag2 = 1, intlow = 0.001,
+                          inthigh = 40, normalize = TRUE, alias_adj = TRUE, kmax = 2, divide = 100L){
+  M = M1*M2
+  dim = 2
+  if(!is.null(X)){
+    p = ncol(X)
+    freqx=seq(-pi/lag1+2*pi/(lag1*M1), pi/lag1, length = M1)
+    freqy=seq(-pi/lag2+2*pi/(lag2*M2), pi/lag2, length = M2)
+    w_use = as.matrix(expand.grid(freqx, freqy))
+    id_0 = c(M1*(M2/2-1)+M1/2, M1*M2/2, M1*(M2-1/2), M1*M2)
+    id_a = seq(M1*(M2/2-1)+M1/2+1, M1*M2/2-1)
+    id_b = seq(M1*M2/2+M1/2, M1*(M2-2)+M1/2, by = M1)
+    id_c = M1*(M2/2 + rep(0:(M2/2-2), each = M1/2-1)) + seq(M1/2+1, M1-1)
+    id_d = id_c - M1/2
+    id_e = seq(M1*(M2-1)+M1/2+1, M1*M2-1)
+    id_f = seq(M1*M2/2+M1, M1*(M2-2)+M1, by = M1)
+    lag = sqrt(lag1^2 + lag2^2)/sqrt(2) # to be verify if lag1 not equal to lag2
+    U2 = as.matrix(expand.grid(1:M1, 1:M2)*lag)
+    Freq_mat = tcrossprod(U2, w_use)
+    id_2_all = c(id_a, id_b, id_c, id_d, id_e, id_f)
+    H1 = 2*cos(Freq_mat[, id_2_all])
+    H2 = -2*sin(Freq_mat[, id_2_all])
+    H3 = cos(Freq_mat[, id_0])
+    c = (2*pi/lag)^(dim)
+    w_use = w_use[c(id_2_all, id_2_all, id_0), ]
+    w_sq = rowSums(w_use^2) 
+    L = cbind(sqrt(1/(M*2))*cbind(H1, H2), sqrt(1/M)*H3)
+    LtX = crossprod(L, X)
+    XtL = t(LtX)
+    diagIndex = seq(1, M*M, by = M+1)
+    if(isTRUE(alias_adj)){
+      n_comb = (2*kmax+1)^2
+      Alias_f1 = rep(-kmax:kmax, each = 2*kmax+1)
+      Alias_f2 = rep(-kmax:kmax, 2*kmax+1)
+      Mat_K1 = 2*pi*matrix(rep(Alias_f1, M), ncol = n_comb, nrow = M, byrow = TRUE)/lag1
+      Mat_K2 = 2*pi*matrix(rep(Alias_f2, M), ncol = n_comb, nrow = M, byrow = TRUE)/lag2
+      w_sq1 = (w_use[,1]+Mat_K1)^2
+      w_sq2 = (w_use[,2]+Mat_K2)^2
+      w_sq = w_sq1+w_sq2
+    }
+    if(isTRUE(alias_adj)){
+      f2 = function(rho){
+        rho_sq = rho^2
+        Mat_Denom = (4*nu/rho_sq + w_sq)^(-(nu+1))
+        Mat_Num = Mat_Denom*(4-rho_sq*w_sq)/(4*nu+rho_sq*w_sq)
+        A = (nu/rho)*rowSums(Mat_Num)/rowSums(Mat_Denom)
+        Lambda = rowSums(exp(lgamma(nu+1)+nu*log(4*nu)-log(pi)-lgamma(nu)-2*nu*log(rho)-(nu+1)*log(4*nu/(rho_sq)+w_sq)))
+        Lambda_inv_half = sqrt(1/Lambda)
+        HalfXSigma = Lambda_inv_half*LtX
+        prodm = crossprod(HalfXSigma)
+        tmp = LtX %*% solve(prodm) %*% XtL
+        tmp2 = outer(A, 1/Lambda, FUN = "*")*tmp
+        W = diag(A) - tmp2
+        sumdiagWsq = sum(W*t(W))
+        Tr = max(sumdiagWsq - (sum(diag(W))^2)/(M-p), .Machine$double.xmin)
+        prior_rho = sqrt(Tr)
+        if(is.nan(prior_rho)) prior_rho = 0
+        return(prior_rho)
+      }
+    }
+    if(alias_adj == FALSE){
+      f2 = function(rho){
+        rho_sq = rho^2
+        A = (nu/rho)*(4-rho_sq*w_sq)/(4*nu+rho_sq*w_sq)
+        Lambda = exp(lgamma(nu+1)+nu*log(4*nu)-log(pi)-lgamma(nu)-
+                       2*nu*log(rho)-(nu+1)*log(4*nu/(rho_sq)+w_sq))
+        Lambda_inv_half = sqrt(1/Lambda)
+        HalfXSigma = Lambda_inv_half*LtX  
+        ### This is actually probably the right way to calculate diagonal matrix times dense one
+        invprodm = solve(crossprod(HalfXSigma))
+        W = Rfast::Outer(1/Lambda, A, oper = "*")*(LtX %*% invprodm %*% XtL)
+        W[diagIndex] = W[diagIndex] - A
+        tW = Rfast::transpose(W)
+        sumdiagWsq = sum(W*tW)
+        Tr = max(sumdiagWsq - (sum(diag(W))^2)/(M-p), .Machine$double.xmin)
+        prior_rho = sqrt(Tr)
+        if(is.nan(prior_rho)) prior_rho = 0
+        return(prior_rho)
+      }
+    }
+  }
+  if(is.null(X)){
+    c1 = (1:(M1/2))/M1
+    c2 = -rev(c1)[-1]
+    c3 = (1:(M2/2))/M2
+    c4 = -rev(c3)[-1]
+    w_all1 = c(c1, c2)
+    index_use1 = c(rep(1:(M1/2), each = 2), M1/2)
+    w_use1 = c(w_all1[index_use1]/lag1)*2*pi-pi/(lag1*M1)
+    w_all2 = c(c3, c4)
+    index_use2 = c(rep(1:(M2/2), each = 2), M2/2)
+    w_use2 = c(w_all2[index_use2]/lag2)*2*pi-pi/(lag1*M1)
+    w_use = as.matrix(expand.grid(w_use1[1:M1], w_use2[1:M2]))
+    w_sq = rowSums(w_use^2)
+    if(isTRUE(alias_adj)){
+      n_comb = (2*kmax+1)^2
+      Alias_f1 = rep(-kmax:kmax, each = 2*kmax+1)
+      Alias_f2 = rep(-kmax:kmax, 2*kmax+1)
+      Mat_K1 = 2*pi*matrix(rep(Alias_f1, M1*M2), ncol = n_comb, nrow = M1*M2, byrow = TRUE)/lag1
+      Mat_K2 = 2*pi*matrix(rep(Alias_f2, M1*M2), ncol = n_comb, nrow = M1*M2, byrow = TRUE)/lag2
+      w_sq1 = (w_use[,1]+Mat_K1)^2
+      w_sq2 = (w_use[,2]+Mat_K2)^2
+      w_sq = w_sq1+w_sq2
+    }
+    if(isTRUE(alias_adj)){
+      f2 = function(rho){
+        if(rho == 0) return(0)
+        rho_sq = rho^2
+        Mat_Denom = (4*nu/rho_sq + w_sq)^(-(nu+1))
+        Mat_Num = Mat_Denom*(4-rho_sq*w_sq)/(4*nu+rho_sq*w_sq)
+        A = (nu/rho)*rowSums(Mat_Num)/rowSums(Mat_Denom)
+        sdA = sd(A)
+        if(is.nan(sdA) | is.na(sdA)) sdA = 0
+        return(sdA)
+      }
+    }
+    if(alias_adj == FALSE){
+      f2 = function(rho){
+        if(rho == 0) return(0)
+        rho_sq = rho^2
+        A = (nu/rho)*(4-rho_sq*w_sq)/(4*nu+rho_sq*w_sq) 
+        sdA = sd(A)
+        if(is.nan(sdA) | is.na(sdA)) sdA = 0
+        return(sdA)
+      }
+    }
+  }
+  intf2 = function(x) sapply(x, f2)
+  constant = 1
+  if(isTRUE(normalize)) constant = integrate(f = intf2, lower = intlow, upper = inthigh, subdivisions = divide)$value
+  outf2 = sapply(rhovec, f2)
+  return(outf2/constant)
+}
+
+
+
+
