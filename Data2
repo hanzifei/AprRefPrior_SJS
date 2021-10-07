@@ -1,0 +1,542 @@
+##############################################################################
+#### Objective Bayesian Analysis of Dataset with Random Design
+##############################################################################
+
+##############################################################################
+#### Load the Following Packages
+library(rust)                  # Implement ROU
+library(matrixcalc)            # Implement SVD if needed (ill-conditioned matrix)
+library(geoR)                  # Get empirical variograms and exploratory analysis
+library(mvtnorm)               # Multivariate normal simulation
+
+#### Packages Loading Done
+################################################################
+
+################################################################
+#### Load the Following Functions 
+
+### Functions to simulate data
+sim_grf = function(nloc = 50, locs, mu = 0, sigsq = 1, nug = 1e-5, 
+                   rho = 0.2, nu = 0.5, sim_n = 100)
+{
+  D = as.matrix(dist(locs, method = "euclidean"))
+  lags = D[upper.tri(D)]
+  Sigma = diag(1, nr = nloc)
+  nug_mat = diag(nug, nr = nloc)
+  lag_rhovec = MaternHS(h = lags, rho = rho, nu = nu)
+  Sigma[upper.tri(Sigma)] = lag_rhovec
+  Sigma = sigsq*(as.matrix(Matrix::forceSymmetric(Sigma)))+nug_mat
+  data = mvtnorm::rmvnorm(n = sim_n, mean = rep(mu, nloc), sigma = Sigma)
+  return(data)
+}
+
+### Empirical HPD 
+emp.hpd = function(x, conf = 0.95){
+  conf = min(conf, 1-conf)
+  n = length(x)
+  nn = round(n*conf)
+  x = sort(x)
+  xx = x[(n-nn+1):n] - x[1:nn]
+  m = min(xx)
+  nnn = which(xx==m)[1]
+  return(c(x[nnn], x[n-nn+nnn]))
+}
+
+### HS parameterization Matern correlation function
+MaternHS = function(h, rho, nu){
+  h[h <= 1e-10] = 1e-10  # avoid sending exact zeroes to besselK
+  if(nu < 0) nu = 1e-10
+  if(rho > 1e9) rho = 1e9
+  con = (2^(nu-1))*gamma(nu) 
+  con = 1/con
+  return(con*((2*sqrt(nu)*h/rho)^nu)*besselK(2*sqrt(nu)*h/rho, nu))
+}
+
+### Above: a lazy function with the same name as the function for general case below. 
+### Just to avoid change in the code. 
+### One can benchmark the time using the above function to fully use the expression that \nu = 0.5
+
+
+### A generic function to calculate derivative w.r.t. range parameter
+MaternHS_drho = function(h, rho, nu){ ### The new version - 2021-06-25
+  h[h < 1e-8] = 1e-8 
+  logc = log(4)+(nu+1)*log(h)+(nu+1)*log(nu)/2-(nu+2)*log(rho)-lgamma(nu)
+  c = exp(logc)
+  B0 = besselK(x = 2*sqrt(nu)*h/rho, nu = nu-1, expon.scaled = FALSE)
+  return(c*B0)
+}
+
+#### Reference prior and posterior function, Need Quantities from global environment: 
+## max_rho
+## nobs
+## D
+## jitter
+## z
+## nu
+## prior_a_ref
+
+rho_noX_ref_prior <- function(x){
+  xmin = .Machine$double.xmin
+  if(x > max_rho) x = max_rho
+  if(x < 1e-8){
+    Sigma = diag(1, nrow = nobs) 
+    Sigma_drho = diag(0, nrow = nobs)
+  }else{
+    Sigma = MaternHS(h = D, rho = x, nu = nu)
+    Sigma_drho = MaternHS_drho(h = D, rho = x, nu = nu)
+    diag(Sigma) = 1; diag(Sigma_drho) = 0
+  }
+  cholSigma = try(chol(Sigma), silent = TRUE)
+  if(inherits(cholSigma, "try-error")){ 
+    Sigma_inv = matrixcalc::svd.inverse(Sigma+diag(jitter, nobs)) 
+  }else{
+    Sigma_inv = chol2inv(cholSigma)
+  }
+  suminv = max(xmin, sum(Sigma_inv))
+  colsumSigma_inv = colSums(Sigma_inv)
+
+  ## Reference Prior
+  SX = matrix(colsumSigma_inv, ncol = 1)
+  SX2 = matrix(rowSums(Sigma_inv), ncol = 1)
+  # These two should be essentially same, unless we have ill-conditioned matrix with svd inverse
+  Q = Sigma_inv - tcrossprod(SX2, SX)/suminv
+  W = Sigma_drho %*% Q
+  Tr = max(sum(W*t(W)) - (sum(diag(W))^2)/(nobs-1), 0) ## Trace 
+  log_prior = log(Tr)/2
+  return(log_prior)
+}
+
+
+rho_noX_ref_rou <- function(x){
+  xmin = .Machine$double.xmin
+  if(x > max_rho) x = max_rho
+  if(x < 1e-8){
+    Sigma = diag(1, nrow = nobs) 
+    Sigma_drho = diag(0, nrow = nobs)
+  }else{
+    Sigma = MaternHS(h = D, rho = x, nu = nu)
+    Sigma_drho = MaternHS_drho(h = D, rho = x, nu = nu)
+    diag(Sigma) = 1; diag(Sigma_drho) = 0
+  }
+  cholSigma = try(chol(Sigma), silent = TRUE)
+  if(inherits(cholSigma, "try-error")){ 
+    Sigma_inv = matrixcalc::svd.inverse(Sigma+diag(jitter, nobs)) 
+    eigen_values = ifelse(eigen(Sigma)$values > xmin, eigen(Sigma)$values, xmin)
+    logdetSigma = Inf  
+  }else{
+    Sigma_inv = chol2inv(cholSigma)
+    logdetSigma = 2*sum(log(diag(cholSigma)))
+  }
+  suminv = max(xmin, sum(Sigma_inv))
+  colsumSigma_inv = colSums(Sigma_inv)
+  betahat = sum(colsumSigma_inv*z)/suminv
+  residual = matrix(z - betahat, ncol = 1)
+  Ssq = max(xmin, sum(tcrossprod(residual)*Sigma_inv))
+  loglik = -logdetSigma/2 - log(suminv)/2 -(prior_a_ref-1+(nobs-1)/2)*log(Ssq)
+  ## Reference Prior
+  SX = matrix(colsumSigma_inv, ncol = 1)
+  SX2 = matrix(rowSums(Sigma_inv), ncol = 1) 
+  # These two should be essentially same, unless we have ill-conditioned matrix with svd inverse
+  Q = Sigma_inv - tcrossprod(SX2, SX)/suminv
+  W = Sigma_drho %*% Q
+  Tr = max(sum(W*t(W)) - (sum(diag(W))^2)/(nobs-1), 0) ## Trace 
+  log_prior = log(Tr)/2
+  log_post = loglik+log_prior
+  betahatvar = 1/suminv            ## Directly used to sample beta if needed 
+  if(x == max_rho) log_post = -Inf
+  return(list(log_post = log_post, log_prior = log_prior, log_lik = loglik, 
+              Ssq = Ssq, betahat = betahat, betahatvar = betahatvar))
+}
+
+#### Approximate Reference prior and posterior function, Need Quantities from global environment: 
+## max_rho
+## nobs
+## D
+## jitter
+## z
+## nu
+## prior_a_aref
+## M1; M2; kmax; lag1; lag2 to obtain w_sq  m_times4 and m_times2 
+
+rho_noX_aref_prior <- function(x){
+  if(x > max_rho) x = max_rho
+  rho_sq = x^2
+  Mat_Denom = (4*nu/rho_sq + w_sq)^(-(nu+1))
+  Mat_Num = Mat_Denom*(4-rho_sq*w_sq)/(4*nu+rho_sq*w_sq)
+  A_qt = (nu/x)*rowSums(Mat_Num)/rowSums(Mat_Denom)
+  A1 = rep(A_qt[1:m_times4], 3)
+  A2 = A_qt[(m_times4+1):m_times2]
+  A = c(A_qt, A1, A2)
+  sdA = sd(A)
+  if(is.nan(sdA) | is.na(sdA)) sdA = 0
+  log_prior = log(sdA)
+  return(log_prior)
+}
+
+rho_noX_aref_rou <- function(x){
+  xmin = .Machine$double.xmin
+  if(x > max_rho) x = max_rho
+  if(x < 1e-8){
+    Sigma = diag(1, nrow = nobs) 
+  }else{
+    Sigma = MaternHS(h = D, rho = x, nu = nu)
+    diag(Sigma) = 1
+  }
+  cholSigma = try(chol(Sigma), silent = TRUE)
+  if(inherits(cholSigma, "try-error")){ ## use svd
+    Sigma_inv = matrixcalc::svd.inverse(Sigma+diag(jitter, nobs))
+    eigen_values = ifelse(eigen(Sigma)$values > xmin, eigen(Sigma)$values, xmin)
+    logdetSigma = Inf 
+  }else{
+    Sigma_inv = chol2inv(cholSigma)
+    logdetSigma = 2*sum(log(diag(cholSigma)))
+  }
+  suminv = max(xmin, sum(Sigma_inv))
+  colsumSigma_inv = colSums(Sigma_inv)
+  betahat = sum(colsumSigma_inv*z)/suminv
+  residual = matrix(z - betahat, ncol = 1)
+  Ssq = max(xmin, sum(tcrossprod(residual)*Sigma_inv))
+  loglik = -logdetSigma/2 - log(suminv)/2 -(prior_a_aref-1+(nobs-1)/2)*log(Ssq)
+  ## Approximate reference prior 
+  rho_sq = x^2
+  Mat_Denom = (4*nu/rho_sq + w_sq)^(-(nu+1))
+  Mat_Num = Mat_Denom*(4-rho_sq*w_sq)/(4*nu+rho_sq*w_sq)
+  A_qt = (nu/x)*rowSums(Mat_Num)/rowSums(Mat_Denom)
+  A1 = rep(A_qt[1:m_times4], 3)
+  A2 = A_qt[(m_times4+1):m_times2]
+  A = c(A_qt, A1, A2)
+  sdA = sd(A)
+  if(is.nan(sdA) | is.na(sdA)) sdA = 0
+  log_prior = log(sdA)
+  log_post = loglik+log_prior  ## To stabalize the normalization
+  if(x == max_rho) log_post = -Inf
+  betahatvar = 1/suminv
+  return(list(log_post = log_post, log_prior = log_prior, log_lik = loglik, 
+              Ssq = Ssq, betahat = betahat, betahatvar = betahatvar))
+}
+
+#### Function to prepare for the quantities required for approximate reference priors.
+#### These quantities only needs to be calculated once.
+wsq_2d_fun = function(M1, M2, kmax, lag1, lag2){
+  dim = 2
+  freqx=seq(-pi/lag1+2*pi/(lag1*M1), pi/lag1, length = M1)
+  freqy=seq(-pi/lag2+2*pi/(lag2*M2), pi/lag2, length = M2)
+  w_use = as.matrix(expand.grid(freqx, freqy))
+  id_0 = c(M1*M2/2, M1*(M2-1/2), M1*M2)
+  id_a = seq(M1*(M2/2-1)+M1/2+1, M1*M2/2-1)
+  id_b = seq(M1*M2/2+M1/2, M1*(M2-2)+M1/2, by = M1)
+  id_c = M1*(M2/2 + rep(0:(M2/2-2), each = M1/2-1)) + seq(M1/2+1, M1-1)
+  id_e = seq(M1*(M2-1)+M1/2+1, M1*M2-1)
+  id_f = seq(M1*M2/2+M1, M1*(M2-2)+M1, by = M1)
+  lag = sqrt(lag1^2 + lag2^2)/sqrt(2) 
+  # In our model we assume lag1=lag2 but they can be different in general
+  id_qt = c(id_c, id_a, id_b, id_e, id_f, id_0) 
+  m_comb = (M1/2+1)*(M2/2+1)-1
+  # order: Times 4 (M1/2-1)*(M2/2-1), Times 2 (M1+M2-4), Times 1 (3)
+  # Total: (M1/2+1)*(M2/2+1)-1 Unique frequencies combo
+  m_times4 = (M1/2-1)*(M2/2-1)
+  m_times2 = m_times4+(M1+M2-4)
+  w_use = w_use[id_qt, ]
+  n_comb = (2*kmax+1)^2
+  Alias_f1 = rep(-kmax:kmax, each = 2*kmax+1)
+  Alias_f2 = rep(-kmax:kmax, 2*kmax+1)
+  Mat_K1 = 2*pi*matrix(rep(Alias_f1, m_comb), ncol = n_comb, nrow = m_comb, byrow = TRUE)/lag1
+  Mat_K2 = 2*pi*matrix(rep(Alias_f2, m_comb), ncol = n_comb, nrow = m_comb, byrow = TRUE)/lag2
+  w_sq1 = (w_use[,1]+Mat_K1)^2
+  w_sq2 = (w_use[,2]+Mat_K2)^2
+  w_sq = w_sq1+w_sq2
+  return(list(w_sq = w_sq, m_times2 = m_times2, m_times4 = m_times4))
+}
+### Function Loading Done
+################################################################
+
+
+
+
+
+
+################################################################
+### Data Analysis of a synthetic Dataset 
+### a setting: rand_locs seed is 2022, and sim_all seed is 2202. i = 1
+
+nobs = 600
+set.seed(2022)
+locs_rand = as.matrix(cbind(runif(nobs), runif(nobs)))
+set.seed(2023)
+data_z = c(sim_grf(nloc = nobs, locs = locs_rand, mu = 0, sigsq = 1, nug = 0, 
+                 rho = 0.3, nu = 1.5, sim_n = 1))
+
+
+## A brief assessment: no nugget model works well (the data is simulated from such a model)
+vario_data = geoR::variog(coords = locs_rand, data = data_z, 
+                          max.dist = 0.7, fix.kappa = TRUE, kappa = 1.5)
+vario_est = variofit(vario_data, fix.nugget = FALSE, fix.kappa = TRUE, kappa = 1.5)
+summary(vario_est)$estimated.pars
+
+
+################################################################################################
+##### Now we first decide smoothness, if it is truely 1.5? 
+##### First do Model Comparison with Marginal Likelihood via approximate priors
+################################################################################################
+
+nu_seq = seq(0.5, 2.0, by = 0.01)
+
+## Approximate reference prior before normalization
+C_nu_fun = function(x, nu){
+  rho_sq = x^2
+  Mat_Denom = (4*nu/rho_sq + w_sq)^(-(nu+1))
+  Mat_Num = Mat_Denom*(4-rho_sq*w_sq)/(4*nu+rho_sq*w_sq)
+  A_qt = (nu/x)*rowSums(Mat_Num)/rowSums(Mat_Denom)
+  A1 = rep(A_qt[1:m_times4], 3)
+  A2 = A_qt[(m_times4+1):m_times2]
+  A = c(A_qt, A1, A2)
+  sdA = sd(A)
+  if(is.nan(sdA) | is.na(sdA)) sdA = 0
+  return(sdA)
+}
+
+rho_noX_aref_nu <- function(x, nu){
+  xmin = .Machine$double.xmin
+  if(x > max_rho) x = max_rho
+  if(x < 1e-8){
+    Sigma = diag(1, nrow = nobs) 
+  }else{
+    Sigma = MaternHS(h = D, rho = x, nu = nu)
+    diag(Sigma) = 1
+  }
+  cholSigma = try(chol(Sigma), silent = TRUE)
+  if(inherits(cholSigma, "try-error")){ ## use svd
+    Sigma_inv = matrixcalc::svd.inverse(Sigma+diag(jitter, nobs))
+    logdetSigma = Inf 
+  }else{
+    Sigma_inv = chol2inv(cholSigma)
+    logdetSigma = 2*sum(log(diag(cholSigma)))
+  }
+  suminv = max(xmin, sum(Sigma_inv))
+  colsumSigma_inv = colSums(Sigma_inv)
+  betahat = sum(colsumSigma_inv*z)/suminv
+  residual = matrix(z - betahat, ncol = 1)
+  Ssq = max(xmin, sum(tcrossprod(residual)*Sigma_inv))
+  loglik = -logdetSigma/2 - log(suminv)/2 -(prior_a_aref-1+(nobs-1)/2)*log(Ssq)
+  ## Approximate reference prior 
+  rho_sq = x^2
+  Mat_Denom = (4*nu/rho_sq + w_sq)^(-(nu+1))
+  Mat_Num = Mat_Denom*(4-rho_sq*w_sq)/(4*nu+rho_sq*w_sq)
+  A_qt = (nu/x)*rowSums(Mat_Num)/rowSums(Mat_Denom)
+  A1 = rep(A_qt[1:m_times4], 3)
+  A2 = A_qt[(m_times4+1):m_times2]
+  A = c(A_qt, A1, A2)
+  sdA = sd(A)
+  if(is.nan(sdA) | is.na(sdA)) sdA = 0
+  log_prior = log(sdA)
+  log_post = loglik+log_prior  ## prior is not normalized
+  if(x == max_rho) log_post = -Inf
+  return(exp(log_post))
+}
+
+int_C_nu_fun = function(x, nu) sapply(x, function(x) C_nu_fun(x, nu))
+C_nu_seq = sapply(nu_seq, function(nu) integrate(f = int_C_nu_fun, lower = 1e-8, upper = 50, nu = nu)$value)
+
+#### Now obtain the integral without C_nu_seq which basically integrate over the marginal posterior of rho
+
+m_nu_fun = function(x, nu) sapply(x, function(x) rho_noX_aref_nu(x, nu))
+C_m_seq = sapply(nu_seq, function(nu) integrate(f = m_nu_fun, lower = 1e-8, upper = 50, nu = nu)$value)
+
+m_nu_seq = C_m_seq/C_nu_seq
+m_nu_normalized = (1/0.01)*m_nu_seq/sum(m_nu_seq)
+
+plot(nu_seq, m_nu_normalized, type = 'l', )
+
+nu_optimal = nu_seq[which.max(m_nu_seq)] ### 1.37
+par(mgp=c(1.9,0.8,0), mai = c(0.6, 0.6, 0.2, 0.2))
+plot(nu_seq, m_nu_normalized, type = 'l', ylim = c(0, 9), lty = 1, 
+     xlab = expression(paste(nu)), lwd = 1.6, 
+     ylab = "Integrated Likelihood", cex.axis = 0.9, cex.main = 0.8, 
+     cex.lab = 0.8)
+## 340*340
+
+
+
+################################################################################################
+##### Smoothness estimation done, nu = 1.37 
+################################################################################################
+
+nu_best = nu_optimal
+
+## Assessment: no nugget model works well (the data is simulated from such a model)
+vario_data = geoR::variog(coords = locs_rand, data = data_z, 
+                             max.dist = 0.7, fix.kappa = TRUE, kappa = nu_best)
+vario_est = variofit(vario_data, fix.nugget = FALSE, fix.kappa = TRUE, kappa = nu_best)
+est_cov = c(vario_est$cov.pars[1], vario_est$cov.pars[2]*2*sqrt(nu_best))
+est_cov
+#
+
+## Produce the plot of variogram after scaling a r_scale as in Diggle et al. (2010)
+par(mgp=c(1.9,0.8,0), mai = c(0.6, 0.6, 0.2, 0.2))
+#plot(locs_rand, cex = 0,  xlim = c(-0.05, 1.05), ylim = c(-0.05, 1.05))
+#points(locs_rand, pch = 16, xlab = "x", ylab = "y", cex = log(3.5+data_z)/3) # bad visualization
+plot(locs_rand, pch = 16, cex = 0.35, xlim = c(-0.05, 1.05), ylim = c(-0.05, 1.05), 
+     xlab = "x", ylab = "y", cex.axis = 0.9)
+
+
+eu_plot = vario_data$u
+par(mgp=c(1.9,0.8,0), mai = c(0.6, 0.6, 0.2, 0.2))
+plot(u_plot, vario_data$v, xlim = c(0, 0.7), ylim = c(0, 1.3), #ylim = c(0, 1), 
+     xlab = "r", ylab = "V(r)", yaxt = "n", cex.axis = 0.9)
+axis(2, at = c(0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2), labels = T, cex.axis = 0.95)
+
+plot_x = seq(0, 0.7, by = 0.01)
+theta_est = vario_est$cov.pars[2]*2*sqrt(nu_best)   # least-square estimate
+sigsq_est = vario_est$cov.pars[1]           # least-square estimate
+lines(x = plot_x, y = sigsq_est-sigsq_est*MaternHS(h = plot_x, rho = theta_est, nu = nu_best))
+## eps 340*325
+
+## Now Start fit the data using likelihood-based method 
+likfitdata = likfit(coords = locs_rand, data = data_z, 
+                    trend = "cte", ini.cov.pars = c(1, 0.4), 
+                    fix.kappa = TRUE, kappa = nu_best, fix.nugget = TRUE, nugget = 0)
+
+est_lik = c(likfitdata$cov.pars[1], likfitdata$cov.pars[2]*2*sqrt(nu_best))
+est_lik
+# 370 times 420 in eps
+
+
+## Now start using objective Bayesian methods with reference prior/approximate reference priors 
+## Settings: 
+z = data_z
+D = unname(as.matrix(dist(locs_rand, method = "euclidean")))
+nu = nu_best
+jitter = 1e-10
+nobs = nrow(D)
+max_rho = 200 
+prior_a_aref = prior_a_ref = 1
+quantile(apply(D, 1, function(x) sort(x)[2]), 0.95)
+max(apply(D, 1, function(x) sort(x)[2]))
+
+# roughly the "largest lags" in horizontal/vertical direction is approximately 0.17
+# the "largest lags" of neighboring locations is 0.21
+# use 0.2 seems work fine, in general it is not too sensitive 
+
+w_tmp = wsq_2d_fun(M1 = 26, M2 = 26, kmax = 5, lag1 = 0.04, lag2 = 0.04)
+w_sq = w_tmp$w_sq
+m_times2 = w_tmp$m_times2
+m_times4 = w_tmp$m_times4
+## Settings end
+
+###########################################################################
+##### Plot the (normalized) Prior and Posterior densities 
+###########################################################################
+
+int_r_prior = function(x) sapply(x, function(x) exp(rho_noX_ref_prior(x)))
+int_ar_prior = function(x) sapply(x, function(x) exp(rho_noX_aref_prior(x)))
+int_r_post = function(x) sapply(x, function(x) exp(rho_noX_ref_rou(x)$log_post+520))
+int_ar_post = function(x) sapply(x, function(x) exp(rho_noX_aref_rou(x)$log_post+520)) 
+
+denum_r_prior = integrate(f = int_r_prior, lower = 0, upper = 100)$value  
+## Use inf may have overflow so use 100
+denum_ar_prior = integrate(f = int_ar_prior, lower = 0, upper = 100)$value
+denum_r_post = integrate(f = int_r_post, lower = 0, upper = 100)$value
+denum_ar_post = integrate(f = int_ar_post, lower = 0, upper = 100)$value
+
+x_plot_seq = seq(1e-4, 1.5, by = 0.01)
+y_r_prior = sapply(x_plot_seq, int_r_prior)/denum_r_prior
+y_ar_prior = sapply(x_plot_seq, int_ar_prior)/denum_ar_prior
+y_r_post = sapply(x_plot_seq, int_r_post)/denum_r_post
+y_ar_post = sapply(x_plot_seq, int_ar_post)/denum_ar_post
+
+par(mgp=c(1.9,0.8,0), mai = c(0.6, 0.6, 0.2, 0.2))
+
+plot(x_plot_seq, y_r_prior, type = 'l', ylim = c(0, 13), lty = 2, xlim = c(0, 1.5), 
+     xlab = expression(paste(vartheta)), lwd = 1.6, 
+     ylab = "Density", cex.axis = 0.9, cex.main = 0.8, 
+     cex.lab = 0.8)
+lines(x_plot_seq, y_ar_prior, type = 'l', col = 'red', lty = 2, lwd = 1.6, xlim = c(0, 1.5))
+
+
+lines(x_plot_seq, y_r_post, type = 'l', col = 'black', lty = 1, lwd = 1.4)
+lines(x_plot_seq, y_ar_post, type = 'l', col = 'red', lty = 1, lwd = 1.4)
+legend(0.6, 12, legend = c("Exact Ref Prior", "Appr Ref Prior", "Exact Ref Posterior", "Appr Ref Posterior"), 
+       lwd=c(1.5, 1.5, 1.5, 1.5), bty = 'n',
+       col=c("black","red", "black", "red"), lty = c(2, 2, 1, 1), cex = 0.75)
+
+
+####  Analytically we can get this posterior mode 
+map_rho_r = optim(0.3, fn = function(x) -rho_noX_ref_rou(x)$log_post, method = "Brent", 
+                  lower = 0, upper = 10)$par  #0.3647653
+map_rho_ar = optim(0.3, fn = function(x) -rho_noX_aref_rou(x)$log_post, method = "Brent", 
+                   lower = 0, upper = 10)$par  #0.3614138
+
+#### Monte Carlo Estimation using ROU 
+t0 = proc.time()
+set.seed(2021)  # arbitrary seed to reproduce 
+result_r_rho = rust::ru(logf = function(x) rho_noX_ref_rou(x)$log_post, r = 1, 
+                        init = 0.3, n = 10000)
+t1 = proc.time()-t0     ## 5502.323
+rho_mc_r = result_r_rho$sim_vals
+
+result_r_rho$pa  # 0.7446016
+plot(result_r_rho$sim_vals,type = 'l')
+round(mean(result_r_rho$sim_vals), 3) #[1] 0.397
+round(median(result_r_rho$sim_vals), 3) #[1] 0.384
+round(emp.hpd(result_r_rho$sim_vals), 3) #[1]0.286 0.535
+
+t0 = proc.time()
+set.seed(2020)
+result_ar_rho = rust::ru(logf = function(x) rho_noX_aref_rou(x)$log_post, r = 1, init = 0.3, n = 10000)
+t2 = proc.time()-t0   ## 2240.118
+rho_mc_ar = result_ar_rho$sim_vals
+
+result_ar_rho$pa  # 0.7394809
+plot(result_ar_rho$sim_vals,type = 'l')
+
+round(mean(result_ar_rho$sim_vals), 3) #[1] 0.391
+round(median(result_ar_rho$sim_vals), 3) # [1] 0.38
+round(emp.hpd(result_ar_rho$sim_vals), 3) #[1] 0.287 0.522
+
+
+####  Sample Posterior of beta and sigsq
+post_betasigsq = function(x){
+  ## Basically calculates Sigma_inv one more time. 
+  ## In large experiments these two steps can be combined
+  xmin = .Machine$double.xmin
+  Sigma = MaternHS(h = D, rho = x, nu = nu)
+  cholSigma = try(chol(Sigma), silent = TRUE)
+  Sigma_inv = chol2inv(cholSigma)
+  suminv = max(xmin, sum(Sigma_inv))
+  colsumSigma_inv = colSums(Sigma_inv)
+  betahat = sum(colsumSigma_inv*z)/suminv
+  residual = matrix(z - betahat, ncol = 1)
+  Ssq = max(xmin, sum(tcrossprod(residual)*Sigma_inv))
+  betahatvar = 1/suminv
+  sigsq_mc = 1/rgamma(n = 1, shape =  (nobs-1)/2, rate = Ssq/2) # assume a = 1
+  beta_mc = rnorm(1, mean = betahat, sd = sqrt(sigsq_mc*betahatvar))
+  return(c(beta_mc, sigsq_mc))
+}
+
+#set.seed(2023)
+betasigsq_mc = t(sapply(c(rho_mc_r, rho_mc_ar), post_betasigsq))
+betasigsq_mc_r = betasigsq_mc[1:10000, ]
+betasigsq_mc_ar = betasigsq_mc[10001:20000, ]
+
+
+round(apply(betasigsq_mc_r, 2, mean), 3) #[1] 0.589 1.519
+round(emp.hpd(betasigsq_mc_r[, 1]), 3) # beta hpd #[1] -0.410  1.706
+round(emp.hpd(betasigsq_mc_r[, 2]), 3) # sigsq hpd #[1] 0.547 2.95
+round(apply(betasigsq_mc_r, 2, function(x) quantile(x, c(0.025, 0.5, 0.975))), 3)
+#[,1]  [,2]
+#2.5%  -0.396 0.672
+#50%    0.561 1.299
+#97.5%  1.791 3.641
+
+round(apply(betasigsq_mc_ar, 2, mean), 3) #[1] 0.582 1.457
+round(emp.hpd(betasigsq_mc_ar[, 1]), 3) # beta hpd #[1] -0.394  1.681
+round(emp.hpd(betasigsq_mc_ar[, 2]), 3) # sigsq hpd #[1] 0.564 2.863
+round(apply(betasigsq_mc_ar, 2, function(x) quantile(x, c(0.025, 0.5, 0.975))), 3)
+#[,1]  [,2]
+#2.5%  -0.358 0.667
+#50%    0.544 1.261
+#97.5%  1.707 3.287
+
+save.image(file = "syndata10000.RData")
+
+### End
